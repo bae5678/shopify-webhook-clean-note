@@ -2,9 +2,9 @@
 const crypto = require("crypto");
 
 // ===== 설정 =====
-// 주문 생성 직후 몇 초 동안만 자동 정리 (기본 60초)
+// 주문 생성 직후 몇 초 동안만 자동 정리 (기본 15초)
 // Vercel 환경변수 CLEAN_WINDOW_SECONDS 로 조절 가능 (예: 30)
-const CLEAN_WINDOW_SECONDS = Number(process.env.CLEAN_WINDOW_SECONDS || 60);
+const CLEAN_WINDOW_SECONDS = Number(process.env.CLEAN_WINDOW_SECONDS || 15);
 
 // ---- raw body (HMAC 검증용)
 async function rawBody(req) {
