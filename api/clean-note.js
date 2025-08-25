@@ -14,41 +14,40 @@ function verifyHmac(raw, hmacHeader, secret) {
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader || "", "utf8"));
 }
 
-// ---- "날짜만 있는 노트" 판별 패턴
-const dateOnlyPatterns = [
-  /^\s*\d{4}-\d{2}-\d{2}\s*$/,                        // 2025-08-31
-  /^\s*\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\s*$/,        // 31/08/2025, 31-08-2025
-  /^\s*(delivery\s*date|delivery\s*day|배송일|납품일)\s*[:\-]?\s*\d{4}-\d{2}-\d{2}\s*$/i,
-  /^\s*\d{1,2}\s+[A-Za-z]{3,}\s+\d{2,4}\s*$/,         // 31 Aug 2025
-  /^\s*[A-Za-z]{3,}\s+\d{1,2},?\s+\d{2,4}\s*$/,       // Aug 31, 2025
-];
+// ---- "(Delivery Date: ...)" 블록만 제거
+// - 괄호 포함 전체 제거
+// - 공백/대소문자/구분자( / 또는 - ) 유연 처리
+// - 여러 개 있으면 모두 제거
+function stripDeliveryDateBlock(note) {
+  if (!note) return { cleaned: "", changed: false };
+  let cleaned = String(note);
 
-function isDateOnlyNote(note) {
-  const t = String(note || "").trim();
-  if (!t) return false;
-  return dateOnlyPatterns.some((re) => re.test(t));
-}
-
-// ---- 태그 안에 “날짜(또는 Delivery Date)”가 이미 있는지 확인
-function hasDateTag(tagsString) {
-  if (!tagsString) return false;
-  const tags = String(tagsString)
-    .split(",")
-    .map(s => s.trim().toLowerCase())
-    .filter(Boolean);
-
-  // 예: "26-08-2025", "26/08/2025", "delivery date: 26/08/2025" 등
-  const dateTagPatterns = [
-    /^\d{4}-\d{2}-\d{2}$/,                 // 2025-08-31
-    /^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$/, // 31/08/2025, 31-08-2025
-    /^delivery date[:\s-]?/,               // "Delivery Date: ..."
+  // 패턴들: (Delivery Date: 26/08/2025), (Delivery Date: 2025-08-26) 등
+  const patterns = [
+    /\s*\(\s*delivery\s*date\s*:\s*\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\s*\)\s*$/gim,
+    /\s*\(\s*delivery\s*date\s*:\s*\d{4}[\/\-]\d{2}[\/\-]\d{2}\s*\)\s*$/gim,
+    // 앞/중간에 있어도 제거 (줄바꿈 앞뒤 포함)
+    /\s*\(\s*delivery\s*date\s*:\s*\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\s*\)\s*/gim,
+    /\s*\(\s*delivery\s*date\s*:\s*\d{4}[\/\-]\d{2}[\/\-]\d{2}\s*\)\s*/gim,
   ];
 
-  return tags.some(tag => dateTagPatterns.some(re => re.test(tag)));
+  const before = cleaned;
+  patterns.forEach((re) => {
+    cleaned = cleaned.replace(re, (m, ...rest) => {
+      // 앞뒤에 남는 과한 공백/개행 정리
+      return " ";
+    });
+  });
+
+  cleaned = cleaned.replace(/[ \t]+\n/g, "\n")   // 줄 끝 여분 공백 제거
+                   .replace(/\n{3,}/g, "\n\n")  // 과한 개행 정리
+                   .trim();
+
+  return { cleaned, changed: cleaned !== before.trim() };
 }
 
-// ---- Shopify 주문 note 비우기 (tags는 절대 건드리지 않음)
-async function clearOrderNote({ store, token, apiVersion, orderId }) {
+// ---- note 업데이트 (tags는 절대 건드리지 않음)
+async function updateOrderNote({ store, token, apiVersion, orderId, note }) {
   const url = `https://${store}.myshopify.com/admin/api/${apiVersion}/orders/${orderId}.json`;
   const resp = await fetch(url, {
     method: "PUT",
@@ -56,9 +55,7 @@ async function clearOrderNote({ store, token, apiVersion, orderId }) {
       "Content-Type": "application/json",
       "X-Shopify-Access-Token": token,
     },
-    body: JSON.stringify({
-      order: { id: orderId, note: "" }, // ✅ note만 비움
-    }),
+    body: JSON.stringify({ order: { id: orderId, note } }),
   });
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
@@ -72,23 +69,25 @@ module.exports = async (req, res) => {
   try {
     const raw = await rawBody(req);
 
+    // Shopify HMAC 검증
     const hmac = req.headers["x-shopify-hmac-sha256"];
     if (!verifyHmac(raw, hmac, process.env.SHOPIFY_WEBHOOK_SECRET)) {
       return res.status(401).send("Invalid HMAC");
     }
 
     const payload = JSON.parse(raw.toString("utf8"));
-    const note = payload?.note;
-    const tags = payload?.tags || "";  // Shopify는 콤마로 연결된 문자열로 옴
+    const originalNote = payload?.note || "";
 
-    // 1) 노트가 "날짜만"인 경우에만 대상
-    // 2) 그리고 이미 "태그에 날짜가 붙어있을 때"만 note를 비움
-    if (isDateOnlyNote(note) && hasDateTag(tags)) {
-      await clearOrderNote({
+    // "(Delivery Date: ...)" 부분만 제거
+    const { cleaned, changed } = stripDeliveryDateBlock(originalNote);
+
+    if (changed) {
+      await updateOrderNote({
         store: process.env.SHOPIFY_STORE,
         token: process.env.SHOPIFY_ADMIN_API_TOKEN,
         apiVersion: process.env.SHOPIFY_API_VERSION || "2025-07",
         orderId: payload.id,
+        note: cleaned, // ✅ 고객 메세지는 그대로, 괄호 블록만 제거된 note로 업데이트
       });
     }
 
