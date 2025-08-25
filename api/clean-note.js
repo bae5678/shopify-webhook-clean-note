@@ -3,7 +3,7 @@ const crypto = require("crypto");
 
 // ===== 설정 =====
 // 주문 생성 직후 몇 초 동안만 자동 정리 (기본 60초)
-// Vercel에서 CLEAN_WINDOW_SECONDS 환경변수로 조절 가능 (예: 30)
+// Vercel 환경변수 CLEAN_WINDOW_SECONDS 로 조절 가능 (예: 30)
 const CLEAN_WINDOW_SECONDS = Number(process.env.CLEAN_WINDOW_SECONDS || 60);
 
 // ---- raw body (HMAC 검증용)
@@ -19,14 +19,15 @@ function verifyHmac(raw, hmacHeader, secret) {
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader || "", "utf8"));
 }
 
-// ---- "(Delivery Date: ...)" 블록만 제거 (괄호 포함, 본문 보존)
+// ---- note에서 (Delivery Date: …) 블록만 제거 (괄호 포함, 본문 보존)
 function stripDeliveryDateBlock(note) {
   if (!note) return { cleaned: "", changed: false };
   let cleaned = String(note);
 
-  // 예: (Delivery Date: 26/08/2025), (Delivery Date: 2025-08-26)
   const patterns = [
+    // (Delivery Date: 26/08/2025), (Delivery Date: 26-08-2025)
     /\s*\(\s*delivery\s*date\s*:\s*\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\s*\)\s*/gim,
+    // (Delivery Date: 2025/08/26), (Delivery Date: 2025-08-26)
     /\s*\(\s*delivery\s*date\s*:\s*\d{4}[\/\-]\d{2}[\/\-]\d{2}\s*\)\s*/gim,
   ];
 
@@ -43,32 +44,62 @@ function stripDeliveryDateBlock(note) {
   return { cleaned, changed: cleaned !== before.trim() };
 }
 
-// ---- 태그에 날짜/Delivery Date 관련 태그가 있는지 (앱이 태그 작업 완료했는지) 확인
-function hasDateTag(tagsString) {
-  if (!tagsString) return false;
-  const tags = String(tagsString)
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
+// ---- note에서 날짜 추출 (태그로 쓰기 위함). YYYY-MM-DD 형태로 정규화 반환.
+function extractDeliveryDateTag(note) {
+  if (!note) return null;
+  const s = String(note);
 
-  const dateTagPatterns = [
-    /^\d{4}-\d{2}-\d{2}$/,                 // 2025-08-31
-    /^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$/, // 31/08/2025, 31-08-2025
-    /^delivery date[:\s-]?/,               // "Delivery Date: ..."
-  ];
-  return tags.some((t) => dateTagPatterns.some((re) => re.test(t)));
+  // 26/08/2025 or 26-08-2025
+  let m = s.match(/\(.*?delivery\s*date\s*:\s*(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4}).*?\)/i);
+  if (m) {
+    const [ , dd, mm, yy ] = m;
+    const day = dd.padStart(2, "0");
+    const mon = mm.padStart(2, "0");
+    const year = yy.length === 2 ? (Number(yy) >= 70 ? `19${yy}` : `20${yy}`) : yy;
+    return `${year}-${mon}-${day}`; // YYYY-MM-DD
+  }
+
+  // 2025/08/26 or 2025-08-26
+  m = s.match(/\(.*?delivery\s*date\s*:\s*(\d{4})[\/\-](\d{2})[\/\-](\d{2}).*?\)/i);
+  if (m) {
+    const [ , yyyy, mm, dd ] = m;
+    return `${yyyy}-${mm}-${dd}`; // YYYY-MM-DD
+  }
+
+  return null;
 }
 
-// ---- note 업데이트 (tags는 절대 변경 X)
-async function updateOrderNote({ store, token, apiVersion, orderId, note }) {
+// ---- 주문 가져오기 (최신 tags/note 상태를 안전하게 업데이트 위해)
+async function getOrder({ store, token, apiVersion, orderId }) {
+  const url = `https://${store}.myshopify.com/admin/api/${apiVersion}/orders/${orderId}.json?fields=id,tags,note`;
+  const resp = await fetch(url, {
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": token,
+    },
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`GET /orders failed: ${resp.status} ${text}`);
+  }
+  const data = await resp.json();
+  return data.order;
+}
+
+// ---- 주문 업데이트 (tags에 날짜 추가 + note에서 블록 제거)
+async function updateOrder({ store, token, apiVersion, orderId, nextTags, nextNote }) {
   const url = `https://${store}.myshopify.com/admin/api/${apiVersion}/orders/${orderId}.json`;
+  const body = { order: { id: orderId } };
+  if (typeof nextTags === "string") body.order.tags = nextTags;
+  if (typeof nextNote === "string") body.order.note = nextNote;
+
   const resp = await fetch(url, {
     method: "PUT",
     headers: {
       "Content-Type": "application/json",
       "X-Shopify-Access-Token": token,
     },
-    body: JSON.stringify({ order: { id: orderId, note } }),
+    body: JSON.stringify(body),
   });
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
@@ -91,7 +122,7 @@ module.exports = async (req, res) => {
     const topic = req.headers["x-shopify-topic"]; // orders/create, orders/updated 등
     const payload = JSON.parse(raw.toString("utf8"));
 
-    // ---- "주문 생성 직후" 짧은 시간 안에서만 동작 (수동 수정 보호)
+    // ---- 주문 생성 직후 짧은 시간 안에서만 수행(사후 수동 수정 보호)
     const createdAt = payload?.created_at ? new Date(payload.created_at) : null;
     let withinWindow = false;
     if (createdAt && !isNaN(createdAt.getTime())) {
@@ -99,35 +130,54 @@ module.exports = async (req, res) => {
       const diffSec = (now.getTime() - createdAt.getTime()) / 1000;
       withinWindow = diffSec >= 0 && diffSec <= CLEAN_WINDOW_SECONDS;
     }
-
-    // create 이벤트는 그대로, updated는 "생성 직후 짧은 시간 안"만 허용
     const allowedByTopic =
       topic === "orders/create" || (topic === "orders/updated" && withinWindow);
 
     if (!allowedByTopic) {
-      // 생성 후 시간이 꽤 지난 수정(=사람이 수동으로 추가 가능성)이라면 절대 건드리지 않음
       return res.status(200).send("ok");
     }
 
-    const originalNote = payload?.note || "";
-    const tags = payload?.tags || "";
+    // 1) note에서 배송일자 태그값 추출
+    const deliveryTag = extractDeliveryDateTag(payload?.note || "");
+    if (!deliveryTag) {
+      // 없으면 할 게 없음
+      return res.status(200).send("ok");
+    }
 
-    // 앱이 태그를 먼저 달아둔 걸 확인(태그가 보존돼야 하므로)
-    const tagReady = hasDateTag(tags);
+    // 2) 최신 주문 데이터 한번 읽어서 tags/note 동기화 안전 업데이트
+    const store = process.env.SHOPIFY_STORE;
+    const token = process.env.SHOPIFY_ADMIN_API_TOKEN;
+    const apiVersion = process.env.SHOPIFY_API_VERSION || "2025-07";
+    const orderId = payload.id;
 
-    if (tagReady && originalNote) {
-      // "(Delivery Date: ...)" 블록만 제거
-      const { cleaned, changed } = stripDeliveryDateBlock(originalNote);
+    const current = await getOrder({ store, token, apiVersion, orderId });
+    const currentTags = String(current.tags || "");
+    const currentNote = String(current.note || "");
 
-      if (changed) {
-        await updateOrderNote({
-          store: process.env.SHOPIFY_STORE,
-          token: process.env.SHOPIFY_ADMIN_API_TOKEN,
-          apiVersion: process.env.SHOPIFY_API_VERSION || "2025-07",
-          orderId: payload.id,
-          note: cleaned, // ✅ 고객 메시지는 보존, 괄호+날짜 블록만 제거
-        });
-      }
+    // 3) tags에 배송일자 태그가 없다면 추가
+    const tagList = currentTags
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
+
+    if (!tagList.includes(deliveryTag)) {
+      tagList.push(deliveryTag);
+    }
+    const nextTags = tagList.join(", ");
+
+    // 4) note에서 "(Delivery Date: ...)" 블록만 제거
+    const { cleaned: nextNote, changed } = stripDeliveryDateBlock(currentNote);
+
+    // 변경사항이 있으면 한 번에 업데이트 (tags + note)
+    if (changed || nextTags !== currentTags) {
+      await updateOrder({
+        store,
+        token,
+        apiVersion,
+        orderId,
+        nextTags,
+        nextNote,
+      });
     }
 
     return res.status(200).send("ok");
