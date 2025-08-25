@@ -4,7 +4,7 @@ const crypto = require("crypto");
 
 /* ===================== 설정 ===================== */
 // 주문 생성 직후 몇 초 동안만 자동 정리 (사후 수동 수정 보호)
-const CLEAN_WINDOW_SECONDS = Number(process.env.CLEAN_WINDOW_SECONDS || 15);
+const CLEAN_WINDOW_SECONDS = Number(process.env.CLEAN_WINDOW_SECONDS || 30);
 // 태그 선호 포맷: 'DMY' | 'YMD'
 //  - DMY: 26-08-2025 (앱 스타일) [기본]
 //  - YMD: 2025-08-26 (연-월-일)
