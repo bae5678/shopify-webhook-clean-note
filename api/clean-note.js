@@ -5,8 +5,8 @@ const crypto = require("crypto");
 /* ===================== 설정 ===================== */
 // 기본 15초(빠른 처리)
 const SOFT_WINDOW_SECONDS = Number(process.env.SOFT_WINDOW_SECONDS || 15);
-// 예외 허용 최대 120초(앱이 늦게 붙이는 경우까지 커버)
-const HARD_WINDOW_SECONDS = Number(process.env.HARD_WINDOW_SECONDS || 60);
+// 예외 허용 최대 90초(앱이 늦게 붙이는 경우까지 커버)
+const HARD_WINDOW_SECONDS = Number(process.env.HARD_WINDOW_SECONDS || 90);
 
 // 태그 선호 포맷: 'DMY' | 'YMD'
 //  - DMY: 26-08-2025 (앱 스타일) [기본]
