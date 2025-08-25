@@ -3,8 +3,11 @@
 const crypto = require("crypto");
 
 /* ===================== 설정 ===================== */
-// 주문 생성 직후 몇 초 동안만 자동 정리 (사후 수동 수정 보호)
-const CLEAN_WINDOW_SECONDS = Number(process.env.CLEAN_WINDOW_SECONDS || 30);
+// 기본 15초(빠른 처리)
+const SOFT_WINDOW_SECONDS = Number(process.env.SOFT_WINDOW_SECONDS || 15);
+// 예외 허용 최대 120초(앱이 늦게 붙이는 경우까지 커버)
+const HARD_WINDOW_SECONDS = Number(process.env.HARD_WINDOW_SECONDS || 120);
+
 // 태그 선호 포맷: 'DMY' | 'YMD'
 //  - DMY: 26-08-2025 (앱 스타일) [기본]
 //  - YMD: 2025-08-26 (연-월-일)
@@ -120,7 +123,7 @@ function normalizeTagsKeepOneDate(tagsArray, targetY, targetM, targetD) {
 
 /* ========== Shopify API 호출 ========== */
 async function getOrder({ store, token, apiVersion, orderId }) {
-  const url = `https://${store}.myshopify.com/admin/api/${apiVersion}/orders/${orderId}.json?fields=id,tags,note`;
+  const url = `https://${store}.myshopify.com/admin/api/${apiVersion}/orders/${orderId}.json?fields=id,tags,note,created_at`;
   const resp = await fetch(url, {
     headers: {
       "Content-Type": "application/json",
@@ -171,19 +174,28 @@ module.exports = async (req, res) => {
     const topic = req.headers["x-shopify-topic"]; // orders/create, orders/updated 등
     const payload = JSON.parse(raw.toString("utf8"));
 
-    // 주문 생성 직후 짧은 시간 안에서만 실행 (사후 수동 수정 보호)
+    // 주문 생성 시각 기준 윈도우 판정
     const createdAt = payload?.created_at ? new Date(payload.created_at) : null;
-    let withinWindow = false;
+    let mode = "deny"; // 'soft' | 'hard' | 'deny'
     if (createdAt && !isNaN(createdAt.getTime())) {
       const now = new Date();
       const diffSec = (now.getTime() - createdAt.getTime()) / 1000;
-      withinWindow = diffSec >= 0 && diffSec <= CLEAN_WINDOW_SECONDS;
+      if (diffSec >= 0 && diffSec <= SOFT_WINDOW_SECONDS) mode = "soft";
+      else if (diffSec > SOFT_WINDOW_SECONDS && diffSec <= HARD_WINDOW_SECONDS) mode = "hard";
+      else mode = "deny";
     }
-    const allowedByTopic =
-      topic === "orders/create" || (topic === "orders/updated" && withinWindow);
-    if (!allowedByTopic) return res.status(200).send("ok");
 
-    // 메모에서 배송일 추출
+    // create는 무조건 허용, updated는 soft/hard 윈도우 안에서만
+    const allowed =
+      topic === "orders/create"
+        ? mode !== "deny"
+        : topic === "orders/updated"
+        ? mode === "soft" || mode === "hard"
+        : false;
+
+    if (!allowed) return res.status(200).send("ok");
+
+    // 메모에 (Delivery Date: …)가 없으면 종료
     const ymd = extractDeliveryYMD(payload?.note || "");
     if (!ymd) return res.status(200).send("ok");
 
